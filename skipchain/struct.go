@@ -551,8 +551,18 @@ func (fl *ForwardLink) Verify(suite cosi.Suite, pubs []kyber.Point) error {
 		return errors.New("wrong hash of forward link")
 	}
 	// this calculation must match the one in omnicon/byzcoinx
-	return cosi.Verify(suite, pubs, fl.Signature.Msg, fl.Signature.Sig,
-		cosi.NewThresholdPolicy(byzcoinx.Threshold(len(pubs))))
+	// TODO we don't know which order the nodes signed, so we need to try
+	// all not very efficient
+	var err error
+	for i := 0; i < len(pubs); i++ {
+		err = cosi.Verify(suite, pubs, fl.Signature.Msg, fl.Signature.Sig,
+			cosi.NewThresholdPolicy(byzcoinx.Threshold(len(pubs))))
+		if err != nil {
+			return nil
+		}
+		pubs = append(pubs[1:], pubs[0])
+	}
+	return err
 }
 
 // IsEmpty indicates whether this forwardlink is merely a placeholder for

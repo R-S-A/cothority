@@ -14,6 +14,7 @@ import (
 	"github.com/dedis/cothority/omniledger/collection"
 	"github.com/dedis/cothority/omniledger/darc"
 	"github.com/dedis/cothority/skipchain"
+	"github.com/dedis/kyber"
 	"github.com/dedis/kyber/util/random"
 	"github.com/dedis/onet"
 	"github.com/dedis/onet/log"
@@ -25,6 +26,8 @@ import (
 const darcIDLen int = 32
 
 const invokeEvolve darc.Action = darc.Action("invoke:evolve")
+
+const rotationWindow time.Duration = 5
 
 // OmniledgerID can be used to refer to this service
 var OmniledgerID onet.ServiceID
@@ -70,6 +73,10 @@ type Service struct {
 	// store transactions. But there is more management overhead, e.g.,
 	// restarting after shutdown, answer getTxs requests and so on.
 	txBuffer txBuffer
+
+	heartbeats        heartbeats
+	heartbeatsTimeout chan string
+	heartbeatsClose   chan bool
 
 	// contracts map kinds to kind specific verification functions
 	contracts map[string]OmniLedgerContract
@@ -167,11 +174,6 @@ func (s *Service) CreateGenesisBlock(req *CreateGenesisBlock) (
 		return nil, err
 	}
 
-	s.pollChanMut.Lock()
-	s.pollChanWG.Add(1)
-	s.pollChan[string(sb.SkipChainID())] = s.startPolling(sb.SkipChainID(), req.BlockInterval)
-	s.pollChanMut.Unlock()
-
 	return &CreateGenesisBlockResponse{
 		Version:   CurrentVersion,
 		Skipblock: sb,
@@ -247,6 +249,7 @@ func (s *Service) SetPropagationTimeout(p time.Duration) {
 	s.storage.PropTimeout = p
 	s.storage.Unlock()
 	s.save()
+	s.skService().SetPropTimeout(p)
 }
 
 func toInstanceID(dID darc.ID) InstanceID {
@@ -260,7 +263,7 @@ func (s *Service) verifyAndFilterTxs(scID skipchain.SkipBlockID, ts []ClientTran
 	var validTxs []ClientTransaction
 	for _, t := range ts {
 		if err := s.verifyClientTx(scID, t); err != nil {
-			log.Error(err)
+			log.Error(s.ServerIdentity(), err)
 			continue
 		}
 		validTxs = append(validTxs, t)
@@ -319,7 +322,7 @@ func (s *Service) createNewBlock(scID skipchain.SkipBlockID, r *onet.Roster, cts
 		// For all other blocks, we try to verify the signature using
 		// the darcs and remove those that do not have a valid
 		// signature before continuing.
-		sbLatest, err := s.db().GetLatest(s.db().GetByID(scID))
+		sbLatest, err := s.db().GetLatestByID(scID)
 		if err != nil {
 			return nil, errors.New(
 				"Could not get latest block from the skipchain: " + err.Error())
@@ -328,6 +331,7 @@ func (s *Service) createNewBlock(scID skipchain.SkipBlockID, r *onet.Roster, cts
 		if r != nil {
 			sb.Roster = r
 		}
+
 		cts = s.verifyAndFilterTxs(sb.SkipChainID(), cts)
 		if len(cts) == 0 {
 			return nil, errors.New("no valid transaction")
@@ -344,7 +348,7 @@ func (s *Service) createNewBlock(scID skipchain.SkipBlockID, r *onet.Roster, cts
 	var scs StateChanges
 	var err error
 	var ctsOK ClientTransactions
-	mr, ctsOK, scs, err = s.createStateChanges(coll, cts)
+	mr, ctsOK, scs, err = s.createStateChanges(coll, scID, cts)
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +428,7 @@ func (s *Service) updateCollection(msg network.Message) {
 
 	log.Lvlf2("%s: Updating transactions for %x", s.ServerIdentity(), sb.SkipChainID())
 	cdb := s.getCollection(sb.SkipChainID())
-	_, _, scs, err := s.createStateChanges(cdb.coll, body.Transactions)
+	_, _, scs, err := s.createStateChanges(cdb.coll, sb.SkipChainID(), body.Transactions)
 	if err != nil {
 		log.Error("Couldn't recreate state changes:", err.Error())
 		return
@@ -445,6 +449,33 @@ func (s *Service) updateCollection(msg network.Message) {
 	// Send OK to all waiting channels
 	for _, ct := range body.Transactions {
 		s.state.informWaitChannel(ct.Instructions.Hash(), true)
+	}
+
+	// check whether the heartbeat monitor exists, if it doesn't we start a
+	// new one
+	interval, err := s.LoadBlockInterval(sb.SkipChainID())
+	if err != nil {
+		log.Error(s.ServerIdentity(), err)
+		return
+	}
+	if s.heartbeats.enabled() && sb.Index == 0 {
+		if s.heartbeats.exists(string(sb.SkipChainID())) {
+			panic("This is a new genesis block, but we're already running " +
+				"the heartbeat monitor, it should never happen.")
+		}
+		log.Lvlf2("%s: started heartbeat monitor for %x", s.ServerIdentity(), sb.SkipChainID())
+		s.heartbeats.start(string(sb.SkipChainID()), interval*rotationWindow, s.heartbeatsTimeout)
+	}
+
+	// if we are the new leader, then start polling
+	if sb.Roster.List[0].Equal(s.ServerIdentity()) {
+		s.pollChanMut.Lock()
+		if _, ok := s.pollChan[string(sb.SkipChainID())]; !ok {
+			log.Lvlf2("%s: new leader started polling for %x", s.ServerIdentity(), sb.SkipChainID())
+			s.pollChanWG.Add(1)
+			s.pollChan[string(sb.SkipChainID())] = s.startPolling(sb.SkipChainID(), interval)
+		}
+		s.pollChanMut.Unlock()
 	}
 }
 
@@ -522,10 +553,15 @@ func (s *Service) startPolling(scID skipchain.SkipBlockID, interval time.Duratio
 					panic("DB is in bad state and cannot find skipchain anymore: " + err.Error() +
 						" This function should never be called on a skipchain that does not exist.")
 				}
-				// We assume the caller of this function is the
-				// current leader. So we generate a tree with
-				// this node as the root.
-				tree := sb.Roster.GenerateNaryTreeWithRoot(len(sb.Roster.List), s.ServerIdentity())
+				leader, err := s.getLeader(scID)
+				if err != nil {
+					panic("getLeader should not return an error if roster is initialised.")
+				}
+				if !leader.Equal(s.ServerIdentity()) {
+					panic("startPolling should always be called by the leader," +
+						" if it isn't, then it did not start or shutdown properly.")
+				}
+				tree := sb.Roster.GenerateNaryTree(len(sb.Roster.List))
 				proto, err := s.CreateProtocol(collectTxProtocol, tree)
 				if err != nil {
 					panic("Protocol creation failed with error: " + err.Error() +
@@ -534,8 +570,12 @@ func (s *Service) startPolling(scID skipchain.SkipBlockID, interval time.Duratio
 						" Hence, we cannot recover from this failure without putting" +
 						" the server in a strange state, so we panic.")
 				}
+				s.storage.Lock()
+				pto := s.storage.PropTimeout
+				s.storage.Unlock()
 				root := proto.(*CollectTxProtocol)
 				root.SkipchainID = scID
+				root.propataionTimeout = pto
 				if err := root.Start(); err != nil {
 					panic("Failed to start the protocol with error: " + err.Error() +
 						" Start() only returns an error when the protocol is not initialised correctly," +
@@ -543,7 +583,6 @@ func (s *Service) startPolling(scID skipchain.SkipBlockID, interval time.Duratio
 						" If you see this message then there may be a programmer error.")
 				}
 
-				protocolTimeout := time.After(s.skService().GetPropTimeout())
 			collectTxLoop:
 				for {
 					select {
@@ -553,9 +592,6 @@ func (s *Service) startPolling(scID skipchain.SkipBlockID, interval time.Duratio
 						} else {
 							break collectTxLoop
 						}
-					case <-protocolTimeout:
-						log.Lvl2(s.ServerIdentity(), "timeout while collecting transactions from other nodes")
-						break collectTxLoop
 					case <-closeSignal:
 						log.Lvl2(s.ServerIdentity(), "stopping polling")
 						return
@@ -576,7 +612,7 @@ func (s *Service) startPolling(scID skipchain.SkipBlockID, interval time.Duratio
 					if err := s.verifyClientTx(scID, txs[0]); err == nil {
 						var cin []Coin
 						for _, instr := range txs[0].Instructions {
-							_, cin, err = s.executeInstruction(cdbI, cin, instr)
+							_, cin, err = s.executeInstruction(cdbI, scID, cin, instr)
 							if err != nil {
 								continue
 							}
@@ -629,7 +665,7 @@ func (s *Service) verifySkipBlock(newID []byte, newSB *skipchain.SkipBlock) bool
 	}
 	ctx := body.Transactions
 	cdb := s.getCollection(newSB.SkipChainID())
-	mtr, _, scs, err := s.createStateChanges(cdb.coll, ctx)
+	mtr, _, scs, err := s.createStateChanges(cdb.coll, newSB.SkipChainID(), ctx)
 	if err != nil {
 		log.Error("Couldn't create state changes:", err)
 		return false
@@ -677,7 +713,7 @@ func (s *Service) verifySkipBlock(newID []byte, newSB *skipchain.SkipBlock) bool
 // createStateChanges goes through all ClientTransactions and creates
 // the appropriate StateChanges. If any of the transactions are invalid,
 // it returns an error.
-func (s *Service) createStateChanges(coll *collection.Collection, cts ClientTransactions) (merkleRoot []byte, ctsOK ClientTransactions, states StateChanges, err error) {
+func (s *Service) createStateChanges(coll *collection.Collection, scID skipchain.SkipBlockID, cts ClientTransactions) (merkleRoot []byte, ctsOK ClientTransactions, states StateChanges, err error) {
 
 	// TODO: Because we depend on making at least one clone per transaction
 	// we need to find out if this is as expensive as it looks, and if so if
@@ -692,9 +728,9 @@ clientTransactions:
 		// otherwise dump it.
 		cdbI := &roCollection{c: cdbTemp.Clone()}
 		for _, instr := range ct.Instructions {
-			scs, cout, err := s.executeInstruction(cdbI, cin, instr)
+			scs, cout, err := s.executeInstruction(cdbI, scID, cin, instr)
 			if err != nil {
-				log.Error("Call to contract returned error:", err)
+				log.Errorf("%s: Call to contract returned error: %s", s.ServerIdentity(), err)
 				continue clientTransactions
 			}
 			for _, sc := range scs {
@@ -712,7 +748,7 @@ clientTransactions:
 	return cdbTemp.GetRoot(), ctsOK, states, nil
 }
 
-func (s *Service) executeInstruction(cdbI CollectionView, cin []Coin, instr Instruction) (scs StateChanges, cout []Coin, err error) {
+func (s *Service) executeInstruction(cdbI CollectionView, scID skipchain.SkipBlockID, cin []Coin, instr Instruction) (scs StateChanges, cout []Coin, err error) {
 	defer func() {
 		if re := recover(); re != nil {
 			err = errors.New(re.(string))
@@ -735,7 +771,7 @@ func (s *Service) executeInstruction(cdbI CollectionView, cin []Coin, instr Inst
 	// Wrap up f() inside of g(), so that we can recover panics
 	// from f().
 	log.Lvlf3("%s: Calling contract %s", s.ServerIdentity(), contractID)
-	return contract(cdbI, instr, cin)
+	return contract(cdbI, scID, instr, cin)
 }
 
 func (s *Service) getLeader(scID skipchain.SkipBlockID) (*network.ServerIdentity, error) {
@@ -756,16 +792,160 @@ func (s *Service) getTxs(leader *network.ServerIdentity, scID skipchain.SkipBloc
 		return []ClientTransaction{}
 	}
 	if !leader.Equal(actualLeader) {
-		log.Lvl1("getTxs came from a wrong leader")
+		log.Warn(s.ServerIdentity(), "getTxs came from a wrong leader")
 		return []ClientTransaction{}
 	}
+	if s.heartbeats.enabled() {
+		s.heartbeats.beat(string(scID))
+	}
 	return s.txBuffer.take(string(scID))
+}
+
+func (s *Service) heartbeatTimeoutMonitor() {
+	go func() {
+		// empty the messages in heartbeatsClose
+	emptyMessagesLabel:
+		for {
+			select {
+			case <-s.heartbeatsClose:
+			default:
+				break emptyMessagesLabel
+			}
+		}
+		for {
+			select {
+			case key := <-s.heartbeatsTimeout:
+				log.Lvlf2("%s: heartbeat timeout at %d for %x", s.ServerIdentity(), time.Now().Unix(), []byte(key))
+				scID := []byte(key)
+				if err := s.startViewChange(scID); err != nil {
+					log.Error(s.ServerIdentity(), err)
+				}
+			case <-s.heartbeatsClose:
+				log.Lvl2(s.ServerIdentity(), "closing heartbeat timeout monitor")
+				return
+			}
+		}
+	}()
+}
+
+func (s *Service) startViewChange(scID skipchain.SkipBlockID) error {
+	sb, err := s.db().GetLatestByID(scID)
+	if err != nil {
+		return err
+	}
+	if len(sb.Roster.List) < 2 {
+		return errors.New("roster size is too small")
+	}
+	if !sb.Roster.List[1].Equal(s.ServerIdentity()) {
+		// i'm not the next leader, do nothing
+		return nil
+	}
+
+	newRoster := onet.NewRoster(append(sb.Roster.List[1:], sb.Roster.List[0]))
+	genesisDarcID, _, err := s.GetCollectionView(scID).GetValues(GenesisReferenceID.Slice())
+	if err != nil {
+		return err
+	}
+	newRosterBuf, err := protobuf.Encode(newRoster)
+	if err != nil {
+		return err
+	}
+
+	ctx := ClientTransaction{
+		Instructions: []Instruction{{
+			InstanceID: InstanceID{
+				DarcID: genesisDarcID,
+				SubID:  oneSubID,
+			},
+			Nonce:  GenNonce(),
+			Index:  0,
+			Length: 1,
+			Invoke: &Invoke{
+				Command: "view_change",
+				Args: []Argument{{
+					Name:  "roster",
+					Value: newRosterBuf,
+				}},
+			},
+		}},
+	}
+	signer := darc.NewSignerEd25519(s.ServerIdentity().Public, s.getPrivateKey())
+	if err = ctx.Instructions[0].SignBy(signer); err != nil {
+		return err
+	}
+
+	log.Lvlf2("%s: proposing view-change for %x", s.ServerIdentity(), scID)
+	_, err = s.createNewBlock(scID, newRoster, []ClientTransaction{ctx})
+	return err
+}
+
+func (s *Service) getPrivateKey() kyber.Scalar {
+	tree := onet.NewRoster([]*network.ServerIdentity{s.ServerIdentity()}).GenerateBinaryTree()
+	tni := s.NewTreeNodeInstance(tree, tree.Root, "dummy")
+	return tni.Private()
+}
+
+// withinInterval checks whether public key targetPk in skipchain scID has the
+// right to be the new leader at the current time. This function should only be
+// called when view-change is enabled.
+func (s *Service) withinInterval(scID skipchain.SkipBlockID, targetPk kyber.Point) error {
+	interval, err := s.LoadBlockInterval(scID)
+	if err != nil {
+		return err
+	}
+	t, err := s.heartbeats.getLatestHeartbeat(string(scID))
+	if err != nil {
+		return err
+	}
+
+	// After a leader dies, good nodes wait for 2*interval before accepting
+	// new leader proposals. For every time window of 2*interval
+	// afterwards, the "next" node in the roster list has a chance to
+	// propose to be a new leader.
+
+	currTime := time.Now()
+	if t.Add(time.Duration(rotationWindow) * interval).After(currTime) {
+		return errors.New("not ready to accept new leader yet")
+	}
+
+	// find the position in the proposer queue
+	latestConfig, err := s.LoadConfig(scID)
+	if err != nil {
+		return err
+	}
+	pos := func() int {
+		var ctr int
+		for _, pk := range latestConfig.Roster.Publics() {
+			if pk.Equal(targetPk) {
+				return ctr
+			}
+			ctr++
+		}
+		return -1
+	}()
+	if pos == -1 || pos == 0 {
+		return errors.New("invalid targetPk " + targetPk.String() + ", or position " + string(pos))
+	}
+
+	// check that the time window matches with the position using the
+	// equation below, note that t = previous heartbeat
+	// t + pos * 2 * interval < now < t + (pos+1) * 2 * interval
+	tLower := t.Add(time.Duration(pos) * rotationWindow * interval)
+	tUpper := t.Add(time.Duration(pos+1) * rotationWindow * interval)
+	if currTime.After(tLower) && currTime.Before(tUpper) {
+		return nil
+	}
+	return errors.New("not your turn to change leader")
 }
 
 // ClosePolling closes the go-routines that are polling for transactions.
 func (s *Service) ClosePolling() {
 	for _, c := range s.pollChan {
-		close(c)
+		c <- true
+	}
+	if s.heartbeats.enabled() {
+		s.heartbeats.closeAll()
+		s.heartbeatsClose <- true
 	}
 	s.pollChanWG.Wait()
 }
@@ -853,6 +1033,15 @@ func (s *Service) isOurChain(gen skipchain.SkipBlockID) bool {
 	return false
 }
 
+// EnableViewChange enables the view-change functionality. View-change is
+// highly time sensitive, if the block interval is very low (e.g., when using
+// tests), then we may see unexpected view-change requests while transactions
+// are still being processed if it is enabled in tests.
+func (s *Service) EnableViewChange() {
+	s.heartbeats = newHeartbeats()
+	s.heartbeatTimeoutMonitor()
+}
+
 // saves this service's config information
 func (s *Service) save() {
 	s.storage.Lock()
@@ -869,9 +1058,11 @@ func (s *Service) save() {
 // deployments.
 func newService(c *onet.Context) (onet.Service, error) {
 	s := &Service{
-		ServiceProcessor: onet.NewServiceProcessor(c),
-		contracts:        make(map[string]OmniLedgerContract),
-		txBuffer:         newTxBuffer(),
+		ServiceProcessor:  onet.NewServiceProcessor(c),
+		contracts:         make(map[string]OmniLedgerContract),
+		txBuffer:          newTxBuffer(),
+		heartbeatsTimeout: make(chan string, 1),
+		heartbeatsClose:   make(chan bool, 1),
 	}
 	if err := s.RegisterHandlers(s.CreateGenesisBlock, s.AddTransaction,
 		s.GetProof); err != nil {

@@ -17,11 +17,12 @@ func init() {
 // CollectTxProtocol is a protocol for collecting pending transactions.
 type CollectTxProtocol struct {
 	*onet.TreeNodeInstance
-	TxsChan      chan ClientTransactions
-	SkipchainID  skipchain.SkipBlockID
-	requestChan  chan structCollectTxRequest
-	responseChan chan structCollectTxResponse
-	getTxs       func(*network.ServerIdentity, skipchain.SkipBlockID) ClientTransactions
+	TxsChan           chan ClientTransactions
+	SkipchainID       skipchain.SkipBlockID
+	requestChan       chan structCollectTxRequest
+	responseChan      chan structCollectTxResponse
+	getTxs            func(*network.ServerIdentity, skipchain.SkipBlockID) ClientTransactions
+	propataionTimeout time.Duration // only need to be set in the root
 }
 
 // CollectTxRequest is the request message that asks the receiver to send their
@@ -72,6 +73,9 @@ func (p *CollectTxProtocol) Start() error {
 	if len(p.SkipchainID) == 0 {
 		return errors.New("missing skipchain ID")
 	}
+	if p.propataionTimeout == 0 {
+		return errors.New("propagation timeout not set")
+	}
 	req := &CollectTxRequest{
 		SkipchainID: p.SkipchainID,
 	}
@@ -82,7 +86,7 @@ func (p *CollectTxProtocol) Start() error {
 	// do not return an error if we fail to send to some children
 	if errs := p.SendToChildrenInParallel(req); len(errs) > 0 {
 		for _, err := range errs {
-			log.Error(err)
+			log.Error(p.ServerIdentity(), err)
 		}
 	}
 	return nil
@@ -117,10 +121,14 @@ func (p *CollectTxProtocol) Dispatch() error {
 
 	// wait for the results to come back and write to the channel
 	if p.IsRoot() {
+		to := time.After(p.propataionTimeout)
+	outer:
 		for range p.List() {
 			select {
 			case resp := <-p.responseChan:
 				p.TxsChan <- resp.Txs
+			case <-to:
+				break outer
 			}
 		}
 	}

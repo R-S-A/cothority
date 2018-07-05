@@ -826,11 +826,6 @@ func (s *Service) SetPropTimeout(t time.Duration) {
 	s.propTimeout = t
 }
 
-// GetPropTimeout retrieves the current propagation timeout.
-func (s *Service) GetPropTimeout() time.Duration {
-	return s.propTimeout
-}
-
 func (s *Service) verifySigs(msg, sig []byte) bool {
 	// If there are no clients, all signatures verify.
 	if len(s.Storage.Clients) == 0 {
@@ -843,6 +838,29 @@ func (s *Service) verifySigs(msg, sig []byte) bool {
 		}
 	}
 	return false
+}
+
+func sameNodes(roster1, roster2 *onet.Roster) bool {
+	if len(roster1.List) != len(roster2.List) {
+		return false
+	}
+
+	// put the first list in a map
+	roster1Map := make(map[string]bool)
+	for _, sid := range roster1.List {
+		roster1Map[sid.String()] = true
+	}
+	if len(roster1Map) != len(roster1.List) {
+		return false
+	}
+
+	// checke that everything in the second list is in the map
+	for _, sid := range roster2.List {
+		if _, ok := roster1Map[sid.String()]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // forwardLinkLevel0 is used to add a new block to the skipchain.
@@ -860,6 +878,12 @@ func (s *Service) forwardLinkLevel0(src, dst *SkipBlock) error {
 
 	// create the message we want to sign for this round
 	roster := src.Roster
+	// If the server identities in the two rosters are the same, then it
+	// might be a view-change, so we use the second roster with the new
+	// leader.
+	if sameNodes(src.Roster, dst.Roster) {
+		roster = dst.Roster
+	}
 	log.Lvlf2("%s is adding forward-link level 0 to: %d->%d with roster %s", s.ServerIdentity(),
 		src.Index, dst.Index, roster.List)
 	fs := &ForwardSignature{
@@ -1155,7 +1179,6 @@ func (s *Service) bftForwardLinkAck(msg, data []byte) bool {
 // startBFT starts a BFT-protocol with the given parameters. We can only
 // start the bft protocol if we're the root.
 func (s *Service) startBFT(proto string, roster *onet.Roster, msg, data []byte) (*byzcoinx.FinalSignature, error) {
-
 	if len(roster.List) == 0 {
 		return nil, errors.New("found empty Roster")
 	}

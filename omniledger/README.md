@@ -42,6 +42,20 @@ never got in. Only 5-6 are 'real' OmniLedger improvements as described in the
 
 The current implementation is doing 1-3.
 
+## View Change
+We implement a simple view-change that re-uses all of existing functionalities 
+in OmniLedger (e.g., block creation and smart contracts). However, does not
+prevent Byzantine leaders yet. We assume the roster is ordered and every node
+observes the same order. Further, the leader polls the followers once every
+`blockInterval`. Using these assumptions, when the current leader stop polling,
+then next leader (according to the roster list) will send out a new
+transaction. This transaction contains the `invoke:config` action which shifts 
+the order of the roster by 1. As a result, the failed leader moves to the end 
+of the roster and the new leader becomes the first. In the contract, every node
+should verify that the new node is the correct next leader and enough time has
+past since the current leader stopped responding.
+
+
 # Structure Definitions
 
 Following is an overview of the most important structures defined in OmniLedger.

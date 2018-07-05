@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/dedis/cothority"
 	"github.com/dedis/cothority/skipchain"
@@ -34,6 +35,7 @@ func TestCollectTx(t *testing.T) {
 
 		root := p.(*CollectTxProtocol)
 		root.SkipchainID = skipchain.SkipBlockID("hello")
+		root.propataionTimeout = time.Second
 		require.NoError(t, root.Start())
 
 		var txs ClientTransactions
@@ -49,6 +51,8 @@ func TestCollectTx(t *testing.T) {
 			}
 		}
 		require.Equal(t, len(txs), n)
+
+		closeQueues(local)
 		local.CloseAll()
 	}
 }
